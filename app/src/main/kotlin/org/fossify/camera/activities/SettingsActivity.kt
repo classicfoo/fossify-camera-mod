@@ -7,7 +7,6 @@ import org.fossify.camera.R
 import org.fossify.camera.databinding.ActivitySettingsBinding
 import org.fossify.camera.extensions.checkLocationPermission
 import org.fossify.camera.extensions.config
-import org.fossify.camera.models.CaptureMode
 import org.fossify.commons.dialogs.*
 import org.fossify.commons.extensions.*
 import org.fossify.commons.helpers.*
@@ -46,7 +45,6 @@ class SettingsActivity : SimpleActivity() {
         setupSavePhotoVideoLocation()
         setupSavePhotosFolder()
         setupPhotoQuality()
-        setupCaptureMode()
         updateTextColors(binding.settingsHolder)
 
         val properPrimaryColor = getProperPrimaryColor()
@@ -270,21 +268,4 @@ class SettingsActivity : SimpleActivity() {
         binding.settingsPhotoQuality.text = "$quality%"
     }
 
-    private fun setupCaptureMode() {
-        updateCaptureMode(config.captureMode)
-        binding.settingsCaptureModeHolder.setOnClickListener {
-            val items = CaptureMode.values().mapIndexed { index, captureMode ->
-                RadioItem(index, getString(captureMode.stringResId), captureMode)
-            }
-
-            RadioGroupDialog(this@SettingsActivity, ArrayList(items), config.captureMode.ordinal) {
-                config.captureMode = it as CaptureMode
-                updateCaptureMode(it)
-            }
-        }
-    }
-
-    private fun updateCaptureMode(captureMode: CaptureMode) {
-        binding.settingsCaptureMode.text = getString(captureMode.stringResId)
-    }
 }
