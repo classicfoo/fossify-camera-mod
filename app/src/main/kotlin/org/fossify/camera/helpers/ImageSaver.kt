@@ -3,20 +3,18 @@ package org.fossify.camera.helpers
 import android.annotation.SuppressLint
 import android.content.ContentResolver
 import android.content.ContentValues
+import android.graphics.ImageFormat
 import android.net.Uri
 import android.provider.MediaStore
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCapture.Metadata
 import androidx.camera.core.ImageCaptureException
-import androidx.camera.core.ImageProxy
-import androidx.camera.core.internal.compat.workaround.ExifRotationAvailability
 import androidx.exifinterface.media.ExifInterface
 import org.fossify.camera.helpers.ImageUtil.CodecFailedException
 import org.fossify.camera.helpers.ImageUtil.imageToJpegByteArray
-import org.fossify.camera.helpers.ImageUtil.jpegImageToJpegByteArray
+import org.fossify.camera.models.CapturedImage
 import org.fossify.camera.models.MediaOutput
 import org.fossify.commons.extensions.copyTo
-import org.fossify.commons.helpers.ensureBackgroundThread
 import org.fossify.commons.helpers.isQPlus
 import java.io.*
 import java.util.*
@@ -27,7 +25,7 @@ import java.util.*
  * */
 class ImageSaver private constructor(
     private val contentResolver: ContentResolver,
-    private val image: ImageProxy,
+    private val image: CapturedImage,
     private val mediaOutput: MediaOutput.ImageCaptureOutput,
     private val metadata: Metadata,
     private val jpegQuality: Int,
@@ -45,14 +43,14 @@ class ImageSaver private constructor(
 
         fun saveImage(
             contentResolver: ContentResolver,
-            image: ImageProxy,
+            image: CapturedImage,
             mediaOutput: MediaOutput.ImageCaptureOutput,
             metadata: Metadata,
             jpegQuality: Int,
             saveExifAttributes: Boolean,
             onImageSaved: (Uri) -> Unit,
             onError: (ImageCaptureException) -> Unit,
-        ) = ImageSaver(
+    ) = ImageSaver(
             contentResolver = contentResolver,
             image = image,
             mediaOutput = mediaOutput,
@@ -65,13 +63,11 @@ class ImageSaver private constructor(
     }
 
     fun saveImage() {
-        ensureBackgroundThread {
-            // Save the image to a temp file first. This is necessary because ExifInterface only
-            // supports saving to File.
-            val tempFile = saveImageToTempFile()
-            if (tempFile != null) {
-                copyTempFileToDestination(tempFile)
-            }
+        // Save the image to a temp file first. This is necessary because ExifInterface only
+        // supports saving to File.
+        val tempFile = saveImageToTempFile()
+        if (tempFile != null) {
+            copyTempFileToDestination(tempFile)
         }
     }
 
@@ -98,19 +94,21 @@ class ImageSaver private constructor(
         }
 
         try {
-            val output = FileOutputStream(tempFile)
-            val byteArray: ByteArray = imageToJpegByteArray(image, jpegQuality)
-            output.write(byteArray)
+            FileOutputStream(tempFile).use { output ->
+                val byteArray: ByteArray = imageToJpegByteArray(image, jpegQuality)
+                output.write(byteArray)
+            }
 
             if (saveExifAttributes) {
                 val exifInterface = ExifInterface(tempFile)
-                val imageByteArray = jpegImageToJpegByteArray(image)
-                val inputStream: InputStream = ByteArrayInputStream(imageByteArray)
-                ExifInterface(inputStream).copyTo(exifInterface)
+                if (image.format == ImageFormat.JPEG) {
+                    val inputStream: InputStream = ByteArrayInputStream(image.data)
+                    ExifInterface(inputStream).copyTo(exifInterface)
+                }
 
                 // Overwrite the original orientation if the quirk exists.
-                if (!ExifRotationAvailability().shouldUseExifOrientation(image)) {
-                    exifInterface.rotate(image.imageInfo.rotationDegrees)
+                if (image.format != ImageFormat.JPEG || !image.shouldUseExifOrientation) {
+                    exifInterface.rotate(image.rotationDegrees)
                 }
 
                 if (metadata.isReversedHorizontal) {
