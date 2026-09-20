@@ -19,7 +19,6 @@ import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.CameraState
 import androidx.camera.core.DisplayOrientedMeteringPointFactory
-import androidx.camera.core.ExperimentalZeroShutterLag
 import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCapture.Builder
@@ -314,7 +313,6 @@ class CameraXPreview(
             .build()
     }
 
-    @OptIn(ExperimentalZeroShutterLag::class)
     private fun getCaptureMode(): Int {
         return if (config.flashlightState == FLASH_OFF) {
             CAPTURE_MODE_ZERO_SHUTTER_LAG
