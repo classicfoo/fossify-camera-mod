@@ -19,12 +19,14 @@ import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.CameraState
 import androidx.camera.core.DisplayOrientedMeteringPointFactory
+import androidx.camera.core.ExperimentalZeroShutterLag
 import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCapture.Builder
-import androidx.camera.core.ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY
 import androidx.camera.core.ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY
+import androidx.camera.core.ImageCapture.CAPTURE_MODE_ZERO_SHUTTER_LAG
 import androidx.camera.core.ImageCapture.ERROR_CAPTURE_FAILED
+import androidx.camera.core.ImageCapture.ERROR_UNKNOWN
 import androidx.camera.core.ImageCapture.FLASH_MODE_AUTO
 import androidx.camera.core.ImageCapture.FLASH_MODE_OFF
 import androidx.camera.core.ImageCapture.FLASH_MODE_ON
@@ -38,7 +40,6 @@ import androidx.camera.core.UseCaseGroup
 import androidx.camera.core.ViewPort
 import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionSelector.PREFER_CAPTURE_RATE_OVER_HIGHER_RESOLUTION
-import androidx.camera.core.resolutionselector.ResolutionSelector.PREFER_HIGHER_RESOLUTION_OVER_CAPTURE_RATE
 import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.core.resolutionselector.ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER
 import androidx.camera.lifecycle.ProcessCameraProvider
@@ -72,6 +73,7 @@ import org.fossify.camera.extensions.toLensFacing
 import org.fossify.camera.helpers.BitmapUtils
 import org.fossify.camera.helpers.CameraErrorHandler
 import org.fossify.camera.helpers.FLASH_ALWAYS_ON
+import org.fossify.camera.helpers.FLASH_OFF
 import org.fossify.camera.helpers.FLASH_ON
 import org.fossify.camera.helpers.ImageQualityManager
 import org.fossify.camera.helpers.ImageSaver
@@ -83,14 +85,18 @@ import org.fossify.camera.helpers.PinchToZoomOnScaleGestureListener
 import org.fossify.camera.helpers.SimpleLocationManager
 import org.fossify.camera.helpers.VideoQualityManager
 import org.fossify.camera.interfaces.MyPreview
-import org.fossify.camera.models.CaptureMode
+import org.fossify.camera.models.CapturedImage
 import org.fossify.camera.models.MediaOutput
 import org.fossify.camera.models.MySize
 import org.fossify.camera.models.ResolutionOption
 import org.fossify.commons.activities.BaseSimpleActivity
 import org.fossify.commons.extensions.toast
 import org.fossify.commons.helpers.PERMISSION_ACCESS_FINE_LOCATION
-import org.fossify.commons.helpers.ensureBackgroundThread
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.Semaphore
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 import kotlin.math.abs
 
 class CameraXPreview(
@@ -109,6 +115,7 @@ class CameraXPreview(
         private const val AF_SIZE = 1.0f / 6.0f
         private const val AE_SIZE = AF_SIZE * 1.5f
         private const val CAMERA_MODE_SWITCH_WAIT_TIME = 500L
+        private const val MAX_PENDING_PHOTOS = 4
     }
 
     private val config = activity.config
@@ -120,6 +127,16 @@ class CameraXPreview(
     private val videoQualityManager = VideoQualityManager(activity)
     private val imageQualityManager = ImageQualityManager(activity)
     private val mediaSizeStore = MediaSizeStore(config)
+    private val photoSaveSlots = Semaphore(MAX_PENDING_PHOTOS, true)
+    private val photoSaveExecutor = ThreadPoolExecutor(
+        1,
+        1,
+        0L,
+        TimeUnit.MILLISECONDS,
+        ArrayBlockingQueue(MAX_PENDING_PHOTOS - 1),
+        { runnable -> Thread(runnable, "CameraPhotoSave") },
+        ThreadPoolExecutor.AbortPolicy()
+    )
 
     private val orientationEventListener =
         object : OrientationEventListener(activity, SensorManager.SENSOR_DELAY_NORMAL) {
@@ -297,10 +314,12 @@ class CameraXPreview(
             .build()
     }
 
+    @OptIn(ExperimentalZeroShutterLag::class)
     private fun getCaptureMode(): Int {
-        return when (config.captureMode) {
-            CaptureMode.MINIMIZE_LATENCY -> CAPTURE_MODE_MINIMIZE_LATENCY
-            CaptureMode.MAXIMIZE_QUALITY -> CAPTURE_MODE_MAXIMIZE_QUALITY
+        return if (config.flashlightState == FLASH_OFF) {
+            CAPTURE_MODE_ZERO_SHUTTER_LAG
+        } else {
+            CAPTURE_MODE_MINIMIZE_LATENCY
         }
     }
 
@@ -318,10 +337,7 @@ class CameraXPreview(
     }
 
     private fun getAllowedResolutionMode(): Int {
-        return when (config.captureMode) {
-            CaptureMode.MINIMIZE_LATENCY -> PREFER_CAPTURE_RATE_OVER_HIGHER_RESOLUTION
-            CaptureMode.MAXIMIZE_QUALITY -> PREFER_HIGHER_RESOLUTION_OVER_CAPTURE_RATE
-        }
+        return PREFER_CAPTURE_RATE_OVER_HIGHER_RESOLUTION
     }
 
     private fun buildVideoCapture(): VideoCapture<Recorder> {
@@ -466,6 +482,10 @@ class CameraXPreview(
         orientationEventListener.disable()
     }
 
+    override fun onDestroy(owner: LifecycleOwner) {
+        photoSaveExecutor.shutdown()
+    }
+
     override fun isInPhotoMode(): Boolean {
         return isPhotoCapture
     }
@@ -582,7 +602,13 @@ class CameraXPreview(
             return
         }
 
+        if (!photoSaveSlots.tryAcquire()) {
+            cameraErrorHandler.handleImageCaptureError(ERROR_CAPTURE_FAILED)
+            return
+        }
+
         listener.onPhotoCaptureStart()
+        listener.shutterAnimation()
 
         val metadata = Metadata().apply {
             isReversedHorizontal = isFrontCameraInUse() && config.flipPhotos
@@ -594,49 +620,126 @@ class CameraXPreview(
         val jpegQuality = config.photoQuality
         val saveExifAttributes = config.savePhotoMetadata
 
-        imageCapture.takePicture(mainExecutor, object : OnImageCapturedCallback() {
-            override fun onCaptureSuccess(image: ImageProxy) {
-                listener.shutterAnimation()
-                playShutterSoundIfEnabled()
-                listener.onPhotoCaptureEnd()
+        try {
+            imageCapture.takePicture(mainExecutor, object : OnImageCapturedCallback() {
+                override fun onCaptureStarted() {
+                    playShutterSoundIfEnabled()
+                }
 
-                ensureBackgroundThread {
-                    image.use {
-                        val mediaOutput = mediaOutputHelper.getImageMediaOutput()
-                        if (mediaOutput is MediaOutput.BitmapOutput) {
-                            val imageBytes = ImageUtil.jpegImageToJpegByteArray(image)
-                            val bitmap = BitmapUtils.makeBitmap(imageBytes)
-                            activity.runOnUiThread {
-                                if (bitmap != null) {
-                                    listener.onImageCaptured(bitmap)
-                                } else {
-                                    cameraErrorHandler.handleImageCaptureError(ERROR_CAPTURE_FAILED)
-                                }
-                            }
-                        } else {
-                            ImageSaver.saveImage(
-                                contentResolver = contentResolver,
-                                image = image,
-                                mediaOutput = mediaOutput,
-                                metadata = metadata,
-                                jpegQuality = jpegQuality,
-                                saveExifAttributes = saveExifAttributes,
-                                onImageSaved = { savedUri ->
-                                    activity.runOnUiThread {
-                                        listener.onMediaSaved(savedUri)
-                                    }
-                                },
-                                onError = ::handleImageSaveError
+                override fun onCaptureSuccess(image: ImageProxy) {
+                    val capturedImage = try {
+                        image.use { ImageUtil.captureImage(it) }
+                    } catch (exception: Exception) {
+                        photoSaveSlots.release()
+                        handleImageCaptureError(
+                            ImageCaptureException(
+                                ERROR_CAPTURE_FAILED,
+                                "Failed to copy captured image",
+                                exception
                             )
-                        }
+                        )
+                        return
                     }
+
+                    // The camera buffer is closed before any compression, EXIF work, or file I/O.
+                    listener.onPhotoCaptureEnd()
+                    enqueueCapturedImage(
+                        image = capturedImage,
+                        metadata = metadata,
+                        jpegQuality = jpegQuality,
+                        saveExifAttributes = saveExifAttributes,
+                    )
+                }
+
+                override fun onError(exception: ImageCaptureException) {
+                    photoSaveSlots.release()
+                    handleImageCaptureError(exception)
+                }
+            })
+        } catch (exception: Exception) {
+            photoSaveSlots.release()
+            handleImageCaptureError(
+                ImageCaptureException(
+                    ERROR_CAPTURE_FAILED,
+                    "Failed to start image capture",
+                    exception
+                )
+            )
+        }
+    }
+
+    private fun enqueueCapturedImage(
+        image: CapturedImage,
+        metadata: Metadata,
+        jpegQuality: Int,
+        saveExifAttributes: Boolean,
+    ) {
+        try {
+            photoSaveExecutor.execute {
+                try {
+                    processCapturedImage(
+                        image = image,
+                        metadata = metadata,
+                        jpegQuality = jpegQuality,
+                        saveExifAttributes = saveExifAttributes,
+                    )
+                } catch (exception: Exception) {
+                    handleImageSaveError(
+                        ImageCaptureException(
+                            ERROR_UNKNOWN,
+                            "Failed to process captured image",
+                            exception
+                        )
+                    )
+                } finally {
+                    photoSaveSlots.release()
                 }
             }
+        } catch (exception: RejectedExecutionException) {
+            photoSaveSlots.release()
+            handleImageSaveError(
+                ImageCaptureException(
+                    ERROR_UNKNOWN,
+                    "Failed to queue captured image",
+                    exception
+                )
+            )
+        }
+    }
 
-            override fun onError(exception: ImageCaptureException) {
-                handleImageCaptureError(exception)
+    private fun processCapturedImage(
+        image: CapturedImage,
+        metadata: Metadata,
+        jpegQuality: Int,
+        saveExifAttributes: Boolean,
+    ) {
+        val mediaOutput = mediaOutputHelper.getImageMediaOutput()
+        if (mediaOutput is MediaOutput.BitmapOutput) {
+            val imageBytes = ImageUtil.imageToJpegByteArray(image, jpegQuality)
+            val bitmap = BitmapUtils.makeBitmap(imageBytes)
+            activity.runOnUiThread {
+                if (bitmap != null) {
+                    listener.onImageCaptured(bitmap)
+                } else {
+                    cameraErrorHandler.handleImageCaptureError(ERROR_CAPTURE_FAILED)
+                }
             }
-        })
+        } else {
+            ImageSaver.saveImage(
+                contentResolver = contentResolver,
+                image = image,
+                mediaOutput = mediaOutput,
+                metadata = metadata,
+                jpegQuality = jpegQuality,
+                saveExifAttributes = saveExifAttributes,
+                onImageSaved = { savedUri ->
+                    activity.runOnUiThread {
+                        listener.onMediaSaved(savedUri)
+                    }
+                },
+                onError = ::handleImageSaveError
+            )
+        }
     }
 
     private fun handleImageCaptureError(exception: ImageCaptureException) {
