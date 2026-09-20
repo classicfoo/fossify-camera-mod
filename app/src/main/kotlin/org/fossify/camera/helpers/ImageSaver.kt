@@ -196,7 +196,9 @@ class ImageSaver private constructor(
                 }
 
                 is MediaOutput.OutputStreamMediaOutput -> {
-                    copyTempFileToOutputStream(tempFile, mediaOutput.outputStream)
+                    mediaOutput.outputStream.use { outputStream ->
+                        copyTempFileToOutputStream(tempFile, outputStream)
+                    }
                     outputUri = mediaOutput.uri
                 }
 

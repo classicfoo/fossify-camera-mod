@@ -576,12 +576,13 @@ class CameraXPreview(
     }
 
     override fun tryTakePicture() {
+        val imageCapture = imageCapture
         if (imageCapture == null) {
             activity.toast(R.string.camera_open_error)
             return
         }
 
-        val imageCapture = imageCapture
+        listener.onPhotoCaptureStart()
 
         val metadata = Metadata().apply {
             isReversedHorizontal = isFrontCameraInUse() && config.flipPhotos
@@ -590,18 +591,22 @@ class CameraXPreview(
             }
         }
 
-        val mediaOutput = mediaOutputHelper.getImageMediaOutput()
-        imageCapture!!.takePicture(mainExecutor, object : OnImageCapturedCallback() {
+        val jpegQuality = config.photoQuality
+        val saveExifAttributes = config.savePhotoMetadata
+
+        imageCapture.takePicture(mainExecutor, object : OnImageCapturedCallback() {
             override fun onCaptureSuccess(image: ImageProxy) {
                 listener.shutterAnimation()
                 playShutterSoundIfEnabled()
+                listener.onPhotoCaptureEnd()
+
                 ensureBackgroundThread {
                     image.use {
+                        val mediaOutput = mediaOutputHelper.getImageMediaOutput()
                         if (mediaOutput is MediaOutput.BitmapOutput) {
                             val imageBytes = ImageUtil.jpegImageToJpegByteArray(image)
                             val bitmap = BitmapUtils.makeBitmap(imageBytes)
                             activity.runOnUiThread {
-                                listener.onPhotoCaptureEnd()
                                 if (bitmap != null) {
                                     listener.onImageCaptured(bitmap)
                                 } else {
@@ -614,15 +619,14 @@ class CameraXPreview(
                                 image = image,
                                 mediaOutput = mediaOutput,
                                 metadata = metadata,
-                                jpegQuality = config.photoQuality,
-                                saveExifAttributes = config.savePhotoMetadata,
+                                jpegQuality = jpegQuality,
+                                saveExifAttributes = saveExifAttributes,
                                 onImageSaved = { savedUri ->
                                     activity.runOnUiThread {
-                                        listener.onPhotoCaptureEnd()
                                         listener.onMediaSaved(savedUri)
                                     }
                                 },
-                                onError = ::handleImageCaptureError
+                                onError = ::handleImageSaveError
                             )
                         }
                     }
@@ -638,6 +642,12 @@ class CameraXPreview(
     private fun handleImageCaptureError(exception: ImageCaptureException) {
         listener.onPhotoCaptureEnd()
         cameraErrorHandler.handleImageCaptureError(exception.imageCaptureError)
+    }
+
+    private fun handleImageSaveError(exception: ImageCaptureException) {
+        activity.runOnUiThread {
+            cameraErrorHandler.handleImageCaptureError(exception.imageCaptureError)
+        }
     }
 
     override fun initPhotoMode() {
