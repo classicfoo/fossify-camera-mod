@@ -92,10 +92,13 @@ import org.fossify.commons.activities.BaseSimpleActivity
 import org.fossify.commons.extensions.toast
 import org.fossify.commons.helpers.PERMISSION_ACCESS_FINE_LOCATION
 import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.Semaphore
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
 
 class CameraXPreview(
@@ -126,7 +129,10 @@ class CameraXPreview(
     private val videoQualityManager = VideoQualityManager(activity)
     private val imageQualityManager = ImageQualityManager(activity)
     private val mediaSizeStore = MediaSizeStore(config)
-    private val photoSaveSlots = Semaphore(MAX_PENDING_PHOTOS, true)
+    private val pendingPhotoSlots = Semaphore(MAX_PENDING_PHOTOS, true)
+    private val photoSnapshotExecutor: ExecutorService = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "CameraPhotoSnapshot")
+    }
     private val photoSaveExecutor = ThreadPoolExecutor(
         1,
         1,
@@ -136,6 +142,7 @@ class CameraXPreview(
         { runnable -> Thread(runnable, "CameraPhotoSave") },
         ThreadPoolExecutor.AbortPolicy()
     )
+    private val thirdPartyCaptureAccepted = AtomicBoolean(false)
 
     private val orientationEventListener =
         object : OrientationEventListener(activity, SensorManager.SENSOR_DELAY_NORMAL) {
@@ -481,6 +488,7 @@ class CameraXPreview(
     }
 
     override fun onDestroy(owner: LifecycleOwner) {
+        photoSnapshotExecutor.shutdown()
         photoSaveExecutor.shutdown()
     }
 
@@ -600,8 +608,12 @@ class CameraXPreview(
             return
         }
 
-        if (!photoSaveSlots.tryAcquire()) {
-            cameraErrorHandler.handleImageCaptureError(ERROR_CAPTURE_FAILED)
+        if (!pendingPhotoSlots.tryAcquire()) {
+            return
+        }
+
+        if (isThirdPartyIntent && !thirdPartyCaptureAccepted.compareAndSet(false, true)) {
+            pendingPhotoSlots.release()
             return
         }
 
@@ -619,16 +631,18 @@ class CameraXPreview(
         val saveExifAttributes = config.savePhotoMetadata
 
         try {
-            imageCapture.takePicture(mainExecutor, object : OnImageCapturedCallback() {
+            imageCapture.takePicture(photoSnapshotExecutor, object : OnImageCapturedCallback() {
                 override fun onCaptureStarted() {
-                    playShutterSoundIfEnabled()
+                    mainExecutor.execute {
+                        playShutterSoundIfEnabled()
+                    }
                 }
 
                 override fun onCaptureSuccess(image: ImageProxy) {
                     val capturedImage = try {
                         image.use { ImageUtil.captureImage(it) }
                     } catch (exception: Exception) {
-                        photoSaveSlots.release()
+                        pendingPhotoSlots.release()
                         handleImageCaptureError(
                             ImageCaptureException(
                                 ERROR_CAPTURE_FAILED,
@@ -650,12 +664,12 @@ class CameraXPreview(
                 }
 
                 override fun onError(exception: ImageCaptureException) {
-                    photoSaveSlots.release()
+                    pendingPhotoSlots.release()
                     handleImageCaptureError(exception)
                 }
             })
         } catch (exception: Exception) {
-            photoSaveSlots.release()
+            pendingPhotoSlots.release()
             handleImageCaptureError(
                 ImageCaptureException(
                     ERROR_CAPTURE_FAILED,
@@ -690,11 +704,11 @@ class CameraXPreview(
                         )
                     )
                 } finally {
-                    photoSaveSlots.release()
+                    pendingPhotoSlots.release()
                 }
             }
         } catch (exception: RejectedExecutionException) {
-            photoSaveSlots.release()
+            pendingPhotoSlots.release()
             handleImageSaveError(
                 ImageCaptureException(
                     ERROR_UNKNOWN,
@@ -719,7 +733,13 @@ class CameraXPreview(
                 if (bitmap != null) {
                     listener.onImageCaptured(bitmap)
                 } else {
-                    cameraErrorHandler.handleImageCaptureError(ERROR_CAPTURE_FAILED)
+                    handleImageSaveError(
+                        ImageCaptureException(
+                            ERROR_CAPTURE_FAILED,
+                            "Failed to decode captured image",
+                            null
+                        )
+                    )
                 }
             }
         } else {
@@ -741,11 +761,19 @@ class CameraXPreview(
     }
 
     private fun handleImageCaptureError(exception: ImageCaptureException) {
+        if (isThirdPartyIntent) {
+            thirdPartyCaptureAccepted.set(false)
+        }
         listener.onPhotoCaptureEnd()
-        cameraErrorHandler.handleImageCaptureError(exception.imageCaptureError)
+        mainExecutor.execute {
+            cameraErrorHandler.handleImageCaptureError(exception.imageCaptureError)
+        }
     }
 
     private fun handleImageSaveError(exception: ImageCaptureException) {
+        if (isThirdPartyIntent) {
+            thirdPartyCaptureAccepted.set(false)
+        }
         activity.runOnUiThread {
             cameraErrorHandler.handleImageCaptureError(exception.imageCaptureError)
         }

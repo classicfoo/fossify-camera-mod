@@ -69,6 +69,7 @@ class MainActivity : SimpleActivity(), PhotoProcessor.MediaSavedListener, Camera
     private var mLastHandledOrientation = 0
     private var countDownTimer: CountDownTimer? = null
     private var mOriginalBrightness: Float? = null
+    private var pendingPhotoCaptures = 0
 
     private val tabSelectedListener = object : TabSelectedListener {
         override fun onTabSelected(tab: TabLayout.Tab) {
@@ -124,7 +125,7 @@ class MainActivity : SimpleActivity(), PhotoProcessor.MediaSavedListener, Camera
             val isInPhotoMode = isInPhotoMode()
             setupPreviewImage(isInPhotoMode)
             mFocusCircleView.setStrokeColor(getProperPrimaryColor())
-            toggleActionButtons(enabled = true)
+            updateCaptureControls()
             mOrientationEventListener.enable()
         }
 
@@ -705,20 +706,49 @@ class MainActivity : SimpleActivity(), PhotoProcessor.MediaSavedListener, Camera
     }
 
     override fun onPhotoCaptureStart() {
-        toggleActionButtons(enabled = false)
+        runOnUiThread {
+            pendingPhotoCaptures++
+            closeOptions()
+            updateCaptureControls()
+        }
     }
 
     override fun onPhotoCaptureEnd() {
-        toggleActionButtons(enabled = true)
+        runOnUiThread {
+            pendingPhotoCaptures = (pendingPhotoCaptures - 1).coerceAtLeast(0)
+            updateCaptureControls()
+        }
     }
 
-    private fun toggleActionButtons(enabled: Boolean) = binding.apply {
-        runOnUiThread {
-            shutter.isClickable = enabled
-            previewView.isEnabled = enabled
-            layoutTop.changeResolution.isEnabled = enabled
-            toggleCamera.isClickable = enabled
-            layoutTop.toggleFlash.isClickable = enabled
+    private fun updateCaptureControls() = binding.apply {
+        val cameraConfigurationEnabled = pendingPhotoCaptures == 0
+
+        // CameraX serializes still captures internally, but the shutter remains available while
+        // the app admits more requests. Focus and zoom also remain available for the next shot.
+        shutter.isClickable = true
+        previewView.isEnabled = true
+
+        layoutTop.changeResolution.isEnabled = cameraConfigurationEnabled
+        toggleCamera.isEnabled = cameraConfigurationEnabled
+        layoutTop.toggleFlash.isEnabled = cameraConfigurationEnabled
+        layoutTop.toggleTimer.isEnabled = cameraConfigurationEnabled
+        layoutTop.settings.isEnabled = cameraConfigurationEnabled
+        lastPhotoVideoPreview.isEnabled = cameraConfigurationEnabled
+        cameraModeTab.isEnabled = cameraConfigurationEnabled
+
+        layoutFlash.flashToggleGroup.isEnabled = cameraConfigurationEnabled
+        setChildrenEnabled(layoutFlash.flashToggleGroup, cameraConfigurationEnabled)
+        layoutTimer.timerToggleGroup.isEnabled = cameraConfigurationEnabled
+        setChildrenEnabled(layoutTimer.timerToggleGroup, cameraConfigurationEnabled)
+        mediaSizeToggleGroup?.let {
+            it.isEnabled = cameraConfigurationEnabled
+            setChildrenEnabled(it, cameraConfigurationEnabled)
+        }
+    }
+
+    private fun setChildrenEnabled(viewGroup: ViewGroup, enabled: Boolean) {
+        for (index in 0 until viewGroup.childCount) {
+            viewGroup.getChildAt(index).isEnabled = enabled
         }
     }
 
@@ -728,7 +758,7 @@ class MainActivity : SimpleActivity(), PhotoProcessor.MediaSavedListener, Camera
     }
 
     override fun onMediaSaved(uri: Uri) {
-        binding.layoutTop.changeResolution.isEnabled = true
+        updateCaptureControls()
         loadLastTakenMedia(uri)
         if (isImageCaptureIntent()) {
             Intent().apply {
