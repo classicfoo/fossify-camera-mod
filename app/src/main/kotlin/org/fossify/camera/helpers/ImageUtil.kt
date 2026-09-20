@@ -3,6 +3,8 @@ package org.fossify.camera.helpers
 import android.graphics.*
 import androidx.annotation.IntRange
 import androidx.camera.core.ImageProxy
+import androidx.camera.core.internal.compat.workaround.ExifRotationAvailability
+import org.fossify.camera.models.CapturedImage
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 
@@ -11,6 +13,51 @@ import java.io.IOException
  * @see androidx.camera.core.internal.utils.ImageUtil
  */
 object ImageUtil {
+
+    fun captureImage(image: ImageProxy): CapturedImage {
+        val format = image.format
+        val data = when (format) {
+            ImageFormat.JPEG -> jpegImageToJpegByteArray(image)
+            ImageFormat.YUV_420_888 -> yuv_420_888toNv21(image)
+            else -> throw IllegalArgumentException("Unsupported image format: $format")
+        }
+
+        return CapturedImage(
+            data = data,
+            format = format,
+            width = image.width,
+            height = image.height,
+            cropRect = Rect(image.cropRect),
+            rotationDegrees = image.imageInfo.rotationDegrees,
+            shouldUseExifOrientation = ExifRotationAvailability().shouldUseExifOrientation(image),
+        )
+    }
+
+    @Throws(CodecFailedException::class)
+    fun imageToJpegByteArray(image: CapturedImage, jpegQuality: Int): ByteArray {
+        val shouldCropImage = shouldCropImage(image)
+        return when (image.format) {
+            ImageFormat.JPEG -> {
+                if (!shouldCropImage) {
+                    image.data
+                } else {
+                    cropJpegByteArray(image.data, image.cropRect, jpegQuality)
+                }
+            }
+
+            ImageFormat.YUV_420_888 -> {
+                nv21ToJpeg(
+                    image.data,
+                    image.width,
+                    image.height,
+                    if (shouldCropImage) image.cropRect else null,
+                    jpegQuality
+                )
+            }
+
+            else -> byteArrayOf()
+        }
+    }
 
     @Throws(CodecFailedException::class)
     fun imageToJpegByteArray(image: ImageProxy, jpegQuality: Int): ByteArray {
@@ -140,6 +187,15 @@ object ImageUtil {
             }
         }
         return nv21
+    }
+
+    private fun shouldCropImage(image: CapturedImage): Boolean {
+        return shouldCropImage(
+            image.width,
+            image.height,
+            image.cropRect.width(),
+            image.cropRect.height()
+        )
     }
 
     /**
